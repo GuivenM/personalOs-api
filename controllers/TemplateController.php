@@ -1,0 +1,347 @@
+<?php
+declare(strict_types=1);
+
+namespace Controllers;
+
+use Config\Database;
+use Helpers\Response;
+use Middleware\Auth;
+
+/**
+ * GET    /api/schedule                  → blocs du jour (depuis le template actif)
+ * GET    /api/schedule/week             → les 7 jours du template actif
+ * GET    /api/schedule/history          → historique 30 jours
+ * PUT    /api/schedule/{id}             → modifier un bloc du template
+ * POST   /api/schedule/reorder          → réordonner les blocs d'un jour
+ *
+ * POST   /api/blocks                    → initialiser les logs du jour
+ * PUT    /api/blocks/{id}               → mettre à jour le statut d'un log
+ */
+class TemplateController
+{
+    public function dispatch(string $method, ?int $id, ?string $action, array $body): void
+    {
+        $user     = Auth::check();
+        $resource = $this->resource();
+
+        match (true) {
+            // ── /api/blocks ───────────────────────────────────────────────
+            $resource === 'blocks' && $method === 'POST' && !$id  => $this->initDay($user, $body),
+            $resource === 'blocks' && $method === 'PUT'  && $id   => $this->updateStatus($user, $id, $body),
+
+            // ── /api/schedule ─────────────────────────────────────────────
+            $resource === 'schedule' && $method === 'GET' && $action === 'week'    => $this->week($user),
+            $resource === 'schedule' && $method === 'GET' && $action === 'history' => $this->history($user),
+            $resource === 'schedule' && $method === 'GET' && !$id                  => $this->today($user),
+            $resource === 'schedule' && $method === 'PUT' && $id                   => $this->updateBlock($user, $id, $body),
+            $resource === 'schedule' && $method === 'POST' && $action === 'reorder'=> $this->reorder($user, $body),
+
+            default => Response::error('Route inconnue.', 404),
+        };
+    }
+
+    // ── GET /api/schedule — blocs du jour ─────────────────────────────────────
+
+    private function today(array $user): void
+    {
+        $date      = $_GET['date'] ?? date('Y-m-d');
+        $dayOfWeek = $this->getDayOfWeek($date); // 0=Lundi, 6=Dimanche
+        $db        = Database::get();
+
+        $templateId = $this->getActiveTemplateId($user['id'], $db);
+        if (!$templateId) {
+            Response::json(['date' => $date, 'blocks' => []]);
+        }
+
+        $nowTime = date('H:i:s');
+
+        $stmt = $db->prepare(
+            'SELECT
+                b.id           AS block_id,
+                b.name,
+                b.description,
+                b.time_start,
+                b.time_end,
+                b.order_index,
+                b.day_of_week,
+                l.id           AS log_id,
+                COALESCE(l.status, "pending") AS status
+             FROM m_w_template_blocks b
+             LEFT JOIN m_w_template_logs l
+                    ON l.template_block_id = b.id AND l.log_date = ?
+             WHERE b.template_id = ? AND b.day_of_week = ?
+             ORDER BY b.order_index ASC'
+        );
+        $stmt->execute([$date, $templateId, $dayOfWeek]);
+        $blocks = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        foreach ($blocks as &$b) {
+            $b['is_current'] = $nowTime >= $b['time_start'] && $nowTime < $b['time_end'];
+        }
+        unset($b);
+
+        Response::json([
+            'date'       => $date,
+            'day_of_week'=> $dayOfWeek,
+            'blocks'     => $blocks,
+        ]);
+    }
+
+    // ── GET /api/schedule/week — les 7 jours ──────────────────────────────────
+
+    private function week(array $user): void
+    {
+        $db         = Database::get();
+        $templateId = $this->getActiveTemplateId($user['id'], $db);
+
+        if (!$templateId) {
+            Response::json(['days' => []]);
+        }
+
+        $stmt = $db->prepare(
+            'SELECT id AS block_id, day_of_week, name, description, time_start, time_end, order_index
+             FROM m_w_template_blocks
+             WHERE template_id = ?
+             ORDER BY day_of_week ASC, order_index ASC'
+        );
+        $stmt->execute([$templateId]);
+        $blocks = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $days = [];
+        $dayNames = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi', 'Dimanche'];
+
+        for ($i = 0; $i <= 6; $i++) {
+            $days[] = [
+                'day_of_week' => $i,
+                'day_name'    => $dayNames[$i],
+                'blocks'      => array_values(array_filter($blocks, fn($b) => (int)$b['day_of_week'] === $i)),
+            ];
+        }
+
+        Response::json([
+            'template_id' => $templateId,
+            'days'        => $days,
+        ]);
+    }
+
+    // ── GET /api/schedule/history — historique 30 jours ───────────────────────
+
+    private function history(array $user): void
+    {
+        $db = Database::get();
+
+        $stmt = $db->prepare(
+            'SELECT
+                l.log_date,
+                COUNT(*)                   AS total,
+                SUM(l.status = "done")     AS done,
+                SUM(l.status = "partial")  AS partial,
+                SUM(l.status = "skipped")  AS skipped,
+                SUM(l.status = "pending")  AS pending
+             FROM m_w_template_logs l
+             JOIN m_w_template_blocks b ON b.id = l.template_block_id
+             JOIN m_w_week_templates t  ON t.id = b.template_id
+             WHERE t.user_id = ?
+               AND l.log_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+             GROUP BY l.log_date
+             ORDER BY l.log_date DESC'
+        );
+        $stmt->execute([$user['id']]);
+        $days = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+        $streak = $this->computeStreak($user['id'], $db);
+
+        Response::json([
+            'streak' => $streak,
+            'days'   => $days,
+        ]);
+    }
+
+    // ── PUT /api/schedule/{id} — modifier un bloc du template ─────────────────
+
+    private function updateBlock(array $user, int $id, array $body): void
+    {
+        $db   = Database::get();
+        $stmt = $db->prepare(
+            'SELECT b.id FROM m_w_template_blocks b
+             JOIN m_w_week_templates t ON t.id = b.template_id
+             WHERE b.id = ? AND t.user_id = ? LIMIT 1'
+        );
+        $stmt->execute([$id, $user['id']]);
+        if (!$stmt->fetch()) Response::error('Bloc introuvable.', 404);
+
+        $allowed = ['name', 'description', 'time_start', 'time_end', 'order_index', 'day_of_week'];
+        $fields  = [];
+        $params  = [];
+
+        foreach ($allowed as $f) {
+            if (array_key_exists($f, $body)) {
+                $fields[] = "$f = ?";
+                $params[] = is_string($body[$f]) ? trim($body[$f]) : $body[$f];
+            }
+        }
+
+        if (!$fields) Response::error('Aucun champ à modifier.', 422);
+
+        $params[] = $id;
+        $db->prepare('UPDATE m_w_template_blocks SET ' . implode(', ', $fields) . ' WHERE id = ?')
+           ->execute($params);
+
+        $stmt = $db->prepare(
+            'SELECT id AS block_id, day_of_week, name, description, time_start, time_end, order_index
+             FROM m_w_template_blocks WHERE id = ? LIMIT 1'
+        );
+        $stmt->execute([$id]);
+        Response::json($stmt->fetch(\PDO::FETCH_ASSOC));
+    }
+
+    // ── POST /api/schedule/reorder ────────────────────────────────────────────
+
+    private function reorder(array $user, array $body): void
+    {
+        $order = $body['order'] ?? [];
+        if (!is_array($order) || !$order) Response::error('Tableau order requis.', 422);
+
+        $db   = Database::get();
+        $stmt = $db->prepare(
+            'UPDATE m_w_template_blocks b
+             JOIN m_w_week_templates t ON t.id = b.template_id
+             SET b.order_index = ?
+             WHERE b.id = ? AND t.user_id = ?'
+        );
+
+        foreach ($order as $index => $blockId) {
+            $stmt->execute([$index + 1, (int)$blockId, $user['id']]);
+        }
+
+        $this->week($user);
+    }
+
+    // ── POST /api/blocks — initialiser les logs du jour ───────────────────────
+
+    private function initDay(array $user, array $body): void
+    {
+        $date      = $body['date'] ?? date('Y-m-d');
+        $dayOfWeek = $this->getDayOfWeek($date);
+        $db        = Database::get();
+
+        $templateId = $this->getActiveTemplateId($user['id'], $db);
+        if (!$templateId) Response::error('Aucun template actif.', 422);
+
+        $stmt = $db->prepare(
+            'SELECT id FROM m_w_template_blocks
+             WHERE template_id = ? AND day_of_week = ?
+             ORDER BY order_index ASC'
+        );
+        $stmt->execute([$templateId, $dayOfWeek]);
+        $blockIds = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+
+        if (!$blockIds) Response::error('Aucun bloc pour ce jour.', 422);
+
+        $stmt = $db->prepare(
+            'INSERT IGNORE INTO m_w_template_logs (user_id, template_block_id, log_date, status)
+             VALUES (?, ?, ?, "pending")'
+        );
+        foreach ($blockIds as $blockId) {
+            $stmt->execute([$user['id'], $blockId, $date]);
+        }
+
+        // Retourner l'état du jour
+        $_GET['date'] = $date;
+        $this->today($user);
+    }
+
+    // ── PUT /api/blocks/{id} — mettre à jour le statut ────────────────────────
+
+    private function updateStatus(array $user, int $logId, array $body): void
+    {
+        $validStatuses = ['done', 'skipped', 'partial', 'pending'];
+        $status = $body['status'] ?? '';
+
+        if (!in_array($status, $validStatuses, true)) {
+            Response::error('Statut invalide.', 422);
+        }
+
+        $db   = Database::get();
+        $stmt = $db->prepare(
+            'SELECT l.id FROM m_w_template_logs l
+             JOIN m_w_template_blocks b ON b.id = l.template_block_id
+             JOIN m_w_week_templates t  ON t.id = b.template_id
+             WHERE l.id = ? AND t.user_id = ? LIMIT 1'
+        );
+        $stmt->execute([$logId, $user['id']]);
+        if (!$stmt->fetch()) Response::error('Log introuvable.', 404);
+
+        $db->prepare('UPDATE m_w_template_logs SET status = ? WHERE id = ?')
+           ->execute([$status, $logId]);
+
+        $stmt = $db->prepare(
+            'SELECT l.id, l.template_block_id AS block_id, l.log_date, l.status,
+                    b.name, b.time_start, b.time_end
+             FROM m_w_template_logs l
+             JOIN m_w_template_blocks b ON b.id = l.template_block_id
+             WHERE l.id = ? LIMIT 1'
+        );
+        $stmt->execute([$logId]);
+        Response::json($stmt->fetch(\PDO::FETCH_ASSOC));
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private function getActiveTemplateId(int $userId, \PDO $db): ?int
+    {
+        $stmt = $db->prepare(
+            'SELECT id FROM m_w_week_templates WHERE user_id = ? AND active = 1 LIMIT 1'
+        );
+        $stmt->execute([$userId]);
+        $id = $stmt->fetchColumn();
+        return $id ? (int)$id : null;
+    }
+
+    private function getDayOfWeek(string $date): int
+    {
+        // 0=Lundi, 6=Dimanche (PHP: 1=Lundi via N)
+        return (int)date('N', strtotime($date)) - 1;
+    }
+
+    private function computeStreak(int $userId, \PDO $db): int
+    {
+        $stmt = $db->prepare(
+            'SELECT DISTINCT l.log_date
+             FROM m_w_template_logs l
+             JOIN m_w_template_blocks b ON b.id = l.template_block_id
+             JOIN m_w_week_templates t  ON t.id = b.template_id
+             WHERE t.user_id = ? AND l.status = "done"
+             ORDER BY l.log_date DESC
+             LIMIT 60'
+        );
+        $stmt->execute([$userId]);
+        $dates = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+
+        if (!$dates) return 0;
+
+        $streak   = 0;
+        $expected = new \DateTime('today');
+
+        foreach ($dates as $dateStr) {
+            $d = new \DateTime($dateStr);
+            if ($streak === 0 && $d < (clone $expected)->modify('-1 day')) break;
+            if ($d->format('Y-m-d') === $expected->format('Y-m-d')) {
+                $streak++;
+                $expected->modify('-1 day');
+            } else {
+                break;
+            }
+        }
+
+        return $streak;
+    }
+
+    private function resource(): string
+    {
+        $uri      = strtok($_SERVER['REQUEST_URI'] ?? '/', '?');
+        $uri      = preg_replace('#^/api#', '', $uri) ?: '/';
+        $segments = array_values(array_filter(explode('/', $uri)));
+        return $segments[0] ?? '';
+    }
+}
