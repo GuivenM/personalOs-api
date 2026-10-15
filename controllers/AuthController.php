@@ -17,6 +17,7 @@ class AuthController
             $method === 'POST' && $action === 'register' => $this->register($body),
             $method === 'POST' && $action === 'logout'   => $this->logout(),
             $method === 'GET'  && $action === 'me'       => $this->me(),
+            $method === 'POST' && $action === 'refresh'  => $this->refresh(),
             default => Response::error('Action auth inconnue.', 404),
         };
     }
@@ -116,6 +117,20 @@ class AuthController
         // sans table de blacklist. Pour cette app privée, on se contente
         // de confirmer : le client supprime son token localement.
         Response::json(['message' => 'Déconnecté. Supprimez votre token côté client.']);
+    }
+
+    // ------------------------------------------------------------------ //
+    // POST /api/auth/refresh — échange un JWT encore valide contre un neuf
+    // (expiration glissante : l'app l'appelle à chaque déverrouillage PIN).
+    // ------------------------------------------------------------------ //
+    private function refresh(): void
+    {
+        $user = Auth::check();
+
+        Response::json([
+            'token' => JWT::encode(['sub' => $user['id']]),
+            'user'  => ['id' => $user['id'], 'username' => $user['username']],
+        ]);
     }
 
     // ------------------------------------------------------------------ //

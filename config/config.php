@@ -14,7 +14,7 @@ return [
     ],
     'jwt' => [
         'secret'  => getenv('JWT_SECRET') ?: 'change-this-secret-in-production',
-        'ttl'     => (int)(getenv('JWT_TTL') ?: 86400), // secondes (24h)
+        'ttl'     => (int)(getenv('JWT_TTL') ?: 2592000), // secondes (30 j) — renouvelé via POST /auth/refresh
         'issuer'  => getenv('APP_URL')    ?: 'https://hubspot.local',
     ],
     'app' => [

@@ -13,6 +13,10 @@ use Middleware\Auth;
  * GET    /api/schedule/history          → historique 30 jours
  * PUT    /api/schedule/{id}             → modifier un bloc du template
  * POST   /api/schedule/reorder          → réordonner les blocs d'un jour
+ * POST   /api/schedule                  → créer un bloc (day_of_week, name, description, time_start, time_end)
+ * DELETE /api/schedule/{id}             → supprimer un bloc (et ses logs)
+ * POST   /api/schedule/copy-day         → copier un jour vers d'autres
+ *                                         { from_day, to_days: [..], mode: append|replace }
  *
  * POST   /api/blocks                    → initialiser les logs du jour
  * PUT    /api/blocks/{id}               → mettre à jour le statut d'un log
@@ -35,6 +39,9 @@ class TemplateController
             $resource === 'schedule' && $method === 'GET' && !$id                  => $this->today($user),
             $resource === 'schedule' && $method === 'PUT' && $id                   => $this->updateBlock($user, $id, $body),
             $resource === 'schedule' && $method === 'POST' && $action === 'reorder'=> $this->reorder($user, $body),
+            $resource === 'schedule' && $method === 'POST' && $action === 'copy-day' => $this->copyDay($user, $body),
+            $resource === 'schedule' && $method === 'POST' && !$id && !$action     => $this->createBlock($user, $body),
+            $resource === 'schedule' && $method === 'DELETE' && $id                 => $this->deleteBlock($user, $id),
 
             default => Response::error('Route inconnue.', 404),
         };
@@ -217,6 +224,163 @@ class TemplateController
         $this->week($user);
     }
 
+
+    // ── POST /api/schedule — créer un bloc ────────────────────────────────────
+
+    private function createBlock(array $user, array $body): void
+    {
+        $dayOfWeek = $this->validDay($body['day_of_week'] ?? null);
+        $name      = trim((string)($body['name'] ?? ''));
+        $desc      = trim((string)($body['description'] ?? ''));
+        $start     = $this->normalizeTime($body['time_start'] ?? null);
+        $end       = $this->normalizeTime($body['time_end'] ?? null);
+
+        $errors = [];
+        if ($dayOfWeek === null) $errors[] = 'day_of_week doit être entre 0 (lundi) et 6 (dimanche).';
+        if ($name === '' || (function_exists('mb_strlen') ? mb_strlen($name) : strlen($name)) > 100) {
+            $errors[] = 'name : 1 à 100 caractères.';
+        }
+        if ($start === null || $end === null) {
+            $errors[] = 'time_start et time_end : format HH:MM ou HH:MM:SS.';
+        } elseif ($start >= $end) {
+            $errors[] = 'time_start doit être avant time_end.';
+        }
+        if ($errors) Response::error('Données invalides.', 422, $errors);
+
+        $db         = Database::get();
+        $templateId = $this->getActiveTemplateId($user['id'], $db);
+        if (!$templateId) Response::error('Aucun template actif.', 422);
+
+        $stmt = $db->prepare(
+            'SELECT COALESCE(MAX(order_index), 0) FROM m_w_template_blocks
+             WHERE template_id = ? AND day_of_week = ?'
+        );
+        $stmt->execute([$templateId, $dayOfWeek]);
+        $order = (int)$stmt->fetchColumn() + 1;
+
+        $db->prepare(
+            'INSERT INTO m_w_template_blocks
+                (template_id, day_of_week, name, description, time_start, time_end, order_index)
+             VALUES (?, ?, ?, ?, ?, ?, ?)'
+        )->execute([$templateId, $dayOfWeek, $name, $desc, $start, $end, $order]);
+
+        $stmt = $db->prepare(
+            'SELECT id AS block_id, day_of_week, name, description, time_start, time_end, order_index
+             FROM m_w_template_blocks WHERE id = ? LIMIT 1'
+        );
+        $stmt->execute([(int)$db->lastInsertId()]);
+        Response::json($stmt->fetch(\PDO::FETCH_ASSOC), 201);
+    }
+
+    // ── DELETE /api/schedule/{id} — supprimer un bloc ─────────────────────────
+    // ATTENTION : supprime aussi les logs de ce bloc (historique, streaks).
+
+    private function deleteBlock(array $user, int $id): void
+    {
+        $db = Database::get();
+        if (!$this->ownsBlock($user['id'], $id, $db)) Response::error('Bloc introuvable.', 404);
+
+        $db->beginTransaction();
+        try {
+            $db->prepare('DELETE FROM m_w_template_logs WHERE template_block_id = ?')->execute([$id]);
+            $db->prepare('DELETE FROM m_w_template_blocks WHERE id = ?')->execute([$id]);
+            $db->commit();
+        } catch (\Throwable $e) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $e;
+        }
+
+        Response::json(['deleted' => $id]);
+    }
+
+    // ── POST /api/schedule/copy-day — copier un jour vers d'autres ────────────
+    // mode "append"  : ajoute les blocs copiés après ceux déjà présents (défaut)
+    // mode "replace" : supprime d'abord les blocs du jour cible (et leurs logs)
+
+    private function copyDay(array $user, array $body): void
+    {
+        $from = $this->validDay($body['from_day'] ?? null);
+        $mode = $body['mode'] ?? 'append';
+        $raw  = $body['to_days'] ?? null;
+
+        $errors = [];
+        if ($from === null) $errors[] = 'from_day doit être entre 0 (lundi) et 6 (dimanche).';
+        if (!in_array($mode, ['append', 'replace'], true)) $errors[] = 'mode : append ou replace.';
+
+        $targets = [];
+        if (!is_array($raw) || !$raw) {
+            $errors[] = 'to_days : tableau non vide requis.';
+        } else {
+            foreach ($raw as $d) {
+                $day = $this->validDay($d);
+                if ($day === null) { $errors[] = 'to_days contient un jour invalide.'; break; }
+                if ($day !== $from) $targets[$day] = $day;
+            }
+            if (!$errors && !$targets) $errors[] = 'Le jour cible doit différer du jour source.';
+        }
+        if ($errors) Response::error('Données invalides.', 422, $errors);
+
+        $db         = Database::get();
+        $templateId = $this->getActiveTemplateId($user['id'], $db);
+        if (!$templateId) Response::error('Aucun template actif.', 422);
+
+        $stmt = $db->prepare(
+            'SELECT name, description, time_start, time_end
+             FROM m_w_template_blocks
+             WHERE template_id = ? AND day_of_week = ?
+             ORDER BY order_index ASC, id ASC'
+        );
+        $stmt->execute([$templateId, $from]);
+        $source = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        if (!$source) Response::error('Le jour source ne contient aucun bloc.', 422);
+
+        $db->beginTransaction();
+        try {
+            $delLogs = $db->prepare(
+                'DELETE l FROM m_w_template_logs l
+                 JOIN m_w_template_blocks b ON b.id = l.template_block_id
+                 WHERE b.template_id = ? AND b.day_of_week = ?'
+            );
+            $delBlocks = $db->prepare(
+                'DELETE FROM m_w_template_blocks WHERE template_id = ? AND day_of_week = ?'
+            );
+            $maxOrder = $db->prepare(
+                'SELECT COALESCE(MAX(order_index), 0) FROM m_w_template_blocks
+                 WHERE template_id = ? AND day_of_week = ?'
+            );
+            $insert = $db->prepare(
+                'INSERT INTO m_w_template_blocks
+                    (template_id, day_of_week, name, description, time_start, time_end, order_index)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+            );
+
+            foreach ($targets as $day) {
+                if ($mode === 'replace') {
+                    $delLogs->execute([$templateId, $day]);
+                    $delBlocks->execute([$templateId, $day]);
+                    $order = 0;
+                } else {
+                    $maxOrder->execute([$templateId, $day]);
+                    $order = (int)$maxOrder->fetchColumn();
+                }
+
+                foreach ($source as $b) {
+                    $insert->execute([
+                        $templateId, $day, $b['name'], $b['description'],
+                        $b['time_start'], $b['time_end'], ++$order,
+                    ]);
+                }
+            }
+
+            $db->commit();
+        } catch (\Throwable $e) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $e;
+        }
+
+        $this->week($user); // renvoie la semaine à jour
+    }
+
     // ── POST /api/blocks — initialiser les logs du jour ───────────────────────
 
     private function initDay(array $user, array $body): void
@@ -296,6 +460,33 @@ class TemplateController
         $stmt->execute([$userId]);
         $id = $stmt->fetchColumn();
         return $id ? (int)$id : null;
+    }
+
+    private function ownsBlock(int $userId, int $blockId, \PDO $db): bool
+    {
+        $stmt = $db->prepare(
+            'SELECT b.id FROM m_w_template_blocks b
+             JOIN m_w_week_templates t ON t.id = b.template_id
+             WHERE b.id = ? AND t.user_id = ? LIMIT 1'
+        );
+        $stmt->execute([$blockId, $userId]);
+        return (bool)$stmt->fetch();
+    }
+
+    /** 0 (lundi) … 6 (dimanche), sinon null. */
+    private function validDay(mixed $v): ?int
+    {
+        if (is_bool($v) || !is_numeric($v)) return null;
+        $n = (int)$v;
+        return ((string)$n === (string)$v || (float)$v === (float)$n) && $n >= 0 && $n <= 6 ? $n : null;
+    }
+
+    /** "HH:MM" ou "HH:MM:SS" → "HH:MM:SS", sinon null. */
+    private function normalizeTime(mixed $v): ?string
+    {
+        if (!is_string($v)) return null;
+        if (!preg_match('/^([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?$/', trim($v), $m)) return null;
+        return sprintf('%s:%s:%s', $m[1], $m[2], $m[3] ?? '00');
     }
 
     private function getDayOfWeek(string $date): int
