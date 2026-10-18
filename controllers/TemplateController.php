@@ -16,6 +16,8 @@ use Middleware\Auth;
  * POST   /api/schedule                  → créer un bloc (day_of_week, name, description, time_start, time_end)
  * DELETE /api/schedule/{id}             → supprimer un bloc (et ses logs)
  * POST   /api/schedule/copy-day         → copier un jour vers d'autres
+ * POST   /api/schedule/import           → importer un planning (lignes de tableur)
+ *                                         { rows: [[..]], mode: append|replace, dry_run: bool }
  *                                         { from_day, to_days: [..], mode: append|replace }
  *
  * POST   /api/blocks                    → initialiser les logs du jour
@@ -40,6 +42,7 @@ class TemplateController
             $resource === 'schedule' && $method === 'PUT' && $id                   => $this->updateBlock($user, $id, $body),
             $resource === 'schedule' && $method === 'POST' && $action === 'reorder'=> $this->reorder($user, $body),
             $resource === 'schedule' && $method === 'POST' && $action === 'copy-day' => $this->copyDay($user, $body),
+            $resource === 'schedule' && $method === 'POST' && $action === 'import'   => $this->importSchedule($user, $body),
             $resource === 'schedule' && $method === 'POST' && !$id && !$action     => $this->createBlock($user, $body),
             $resource === 'schedule' && $method === 'DELETE' && $id                 => $this->deleteBlock($user, $id),
 
@@ -379,6 +382,249 @@ class TemplateController
         }
 
         $this->week($user); // renvoie la semaine à jour
+    }
+
+
+    // ── POST /api/schedule/import — importer un planning depuis un tableur ────
+    // Colonnes (avec ou sans ligne d'en-tête) : day, start, end, name, description.
+    // « day » accepte Mon / Monday / Lun / Lundi / 1-7, des listes (Mon/Wed/Fri),
+    // des plages (Mon-Fri), et daily / weekdays / weekend (tous les jours, etc.).
+    // mode "replace" ne remplace QUE les jours présents dans l'import.
+    // dry_run=true : valide et résume sans rien écrire.
+
+    private function importSchedule(array $user, array $body): void
+    {
+        $rows = $body['rows'] ?? null;
+        $mode = $body['mode'] ?? 'append';
+        $dry  = !empty($body['dry_run']);
+
+        if (!is_array($rows) || !$rows) Response::error('rows : tableau non vide requis.', 422);
+        if (count($rows) > 500) Response::error('Import limité à 500 lignes.', 422);
+        if (!in_array($mode, ['append', 'replace'], true)) Response::error('mode : append ou replace.', 422);
+
+        [$blocks, $errors] = $this->parseScheduleRows($rows);
+        if ($errors) Response::error('Import invalide.', 422, array_slice($errors, 0, 20));
+        if (!$blocks) Response::error('Aucun bloc trouvé dans l\'import.', 422);
+
+        $db         = Database::get();
+        $templateId = $this->getActiveTemplateId($user['id'], $db);
+        if (!$templateId) Response::error('Aucun template actif.', 422);
+
+        $byDay = [];
+        foreach ($blocks as $b) $byDay[$b['day']][] = $b;
+        ksort($byDay);
+
+        $toDelete = 0;
+        if ($mode === 'replace') {
+            $count = $db->prepare(
+                'SELECT COUNT(*) FROM m_w_template_blocks WHERE template_id = ? AND day_of_week = ?'
+            );
+            foreach (array_keys($byDay) as $day) {
+                $count->execute([$templateId, $day]);
+                $toDelete += (int)$count->fetchColumn();
+            }
+        }
+
+        $summary = [
+            'dry_run'          => $dry,
+            'mode'             => $mode,
+            'blocks_to_create' => count($blocks),
+            'blocks_to_delete' => $toDelete,
+            'days'             => (object)array_map('count', $byDay),   // objet JSON { "0": 5, "1": 4, … }
+        ];
+        if ($dry) Response::json($summary);
+
+        $db->beginTransaction();
+        try {
+            $delLogs = $db->prepare(
+                'DELETE l FROM m_w_template_logs l
+                 JOIN m_w_template_blocks b ON b.id = l.template_block_id
+                 WHERE b.template_id = ? AND b.day_of_week = ?'
+            );
+            $delBlocks = $db->prepare(
+                'DELETE FROM m_w_template_blocks WHERE template_id = ? AND day_of_week = ?'
+            );
+            $maxOrder = $db->prepare(
+                'SELECT COALESCE(MAX(order_index), 0) FROM m_w_template_blocks
+                 WHERE template_id = ? AND day_of_week = ?'
+            );
+            $insert = $db->prepare(
+                'INSERT INTO m_w_template_blocks
+                    (template_id, day_of_week, name, description, time_start, time_end, order_index)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+            );
+
+            foreach ($byDay as $day => $dayBlocks) {
+                if ($mode === 'replace') {
+                    $delLogs->execute([$templateId, $day]);
+                    $delBlocks->execute([$templateId, $day]);
+                    $order = 0;
+                } else {
+                    $maxOrder->execute([$templateId, $day]);
+                    $order = (int)$maxOrder->fetchColumn();
+                }
+                foreach ($dayBlocks as $b) {
+                    $insert->execute([
+                        $templateId, $day, $b['name'], $b['description'],
+                        $b['start'], $b['end'], ++$order,
+                    ]);
+                }
+            }
+            $db->commit();
+        } catch (\Throwable $e) {
+            if ($db->inTransaction()) $db->rollBack();
+            throw $e;
+        }
+
+        Response::json($summary);
+    }
+
+    /**
+     * @param  array<int, mixed> $rows lignes brutes (tableaux de cellules)
+     * @return array{0: array<int, array>, 1: string[]} [blocs, erreurs]
+     */
+    private function parseScheduleRows(array $rows): array
+    {
+        $aliases = [
+            'day'         => ['day', 'days', 'jour', 'jours'],
+            'start'       => ['start', 'begin', 'from', 'debut', 'début', 'time_start', 'start_time', 'heure_debut'],
+            'end'         => ['end', 'fin', 'to', 'until', 'time_end', 'end_time', 'heure_fin'],
+            'name'        => ['name', 'nom', 'title', 'titre', 'block', 'bloc', 'activity', 'activite', 'activité'],
+            'description' => ['description', 'desc', 'notes', 'note'],
+        ];
+        $map = ['day' => 0, 'start' => 1, 'end' => 2, 'name' => 3, 'description' => 4];
+
+        // Normalise : chaque ligne → tableau de cellules trimées ; les lignes vides sont ignorées
+        $clean = [];
+        foreach ($rows as $i => $row) {
+            if (!is_array($row)) return [[], ['Ligne ' . ($i + 1) . ' : doit être un tableau de cellules.']];
+            $cells = array_map(fn($c) => trim((string)$c), array_values($row));
+            if (implode('', $cells) === '') continue;
+            $clean[] = ['n' => $i + 1, 'cells' => $cells];
+        }
+        if (!$clean) return [[], []];
+
+        // En-tête ? (au moins une cellule reconnue comme nom de colonne)
+        $first = array_map('strtolower', $clean[0]['cells']);
+        $found = [];
+        foreach ($first as $idx => $cell) {
+            foreach ($aliases as $key => $names) {
+                if (in_array($cell, $names, true)) $found[$key] = $idx;
+            }
+        }
+        if ($found) {
+            $missing = array_diff(['day', 'start', 'end', 'name'], array_keys($found));
+            if ($missing) {
+                return [[], ['En-tête : colonne(s) manquante(s) : ' . implode(', ', $missing) . '.']];
+            }
+            $map = $found + ['description' => -1];
+            array_shift($clean);
+        }
+
+        $blocks = [];
+        $errors = [];
+        foreach ($clean as $r) {
+            $c   = $r['cells'];
+            $n   = $r['n'];
+            $get = fn(string $k) => ($map[$k] >= 0 && isset($c[$map[$k]])) ? $c[$map[$k]] : '';
+
+            $days  = $this->parseDays($get('day'));
+            $start = $this->parseFlexibleTime($get('start'));
+            $end   = $this->parseFlexibleTime($get('end'));
+            $name  = $get('name');
+            $desc  = $get('description');
+
+            $rowErrors = [];
+            if ($days === null)  $rowErrors[] = 'jour invalide « ' . $get('day') . ' »';
+            if ($start === null) $rowErrors[] = 'heure de début invalide « ' . $get('start') . ' »';
+            if ($end === null)   $rowErrors[] = 'heure de fin invalide « ' . $get('end') . ' »';
+            if ($start !== null && $end !== null && $start >= $end) $rowErrors[] = 'la fin doit être après le début';
+            if ($name === '') {
+                $rowErrors[] = 'nom manquant';
+            } elseif ((function_exists('mb_strlen') ? mb_strlen($name) : strlen($name)) > 100) {
+                $rowErrors[] = 'nom trop long (100 max)';
+            }
+
+            if ($rowErrors) {
+                $errors[] = "Ligne $n : " . implode(', ', $rowErrors) . '.';
+                continue;
+            }
+            foreach ($days as $day) {
+                $blocks[] = ['day' => $day, 'start' => $start, 'end' => $end, 'name' => $name, 'description' => $desc];
+            }
+        }
+
+        // Ordre d'insertion : par heure de début au sein de chaque jour
+        usort($blocks, fn($a, $b) => [$a['day'], $a['start']] <=> [$b['day'], $b['start']]);
+        return [$blocks, $errors];
+    }
+
+    /** "Mon-Fri", "Lun/Mer/Ven", "daily", "weekdays", "1-5"… → [0..6] ou null. */
+    private function parseDays(string $raw): ?array
+    {
+        static $names = [
+            'mon' => 0, 'monday' => 0, 'lun' => 0, 'lundi' => 0, '1' => 0,
+            'tue' => 1, 'tues' => 1, 'tuesday' => 1, 'mar' => 1, 'mardi' => 1, '2' => 1,
+            'wed' => 2, 'wednesday' => 2, 'mer' => 2, 'mercredi' => 2, '3' => 2,
+            'thu' => 3, 'thur' => 3, 'thurs' => 3, 'thursday' => 3, 'jeu' => 3, 'jeudi' => 3, '4' => 3,
+            'fri' => 4, 'friday' => 4, 'ven' => 4, 'vendredi' => 4, '5' => 4,
+            'sat' => 5, 'saturday' => 5, 'sam' => 5, 'samedi' => 5, '6' => 5,
+            'sun' => 6, 'sunday' => 6, 'dim' => 6, 'dimanche' => 6, '7' => 6,
+        ];
+        static $groups = [
+            'daily' => [0, 1, 2, 3, 4, 5, 6], 'everyday' => [0, 1, 2, 3, 4, 5, 6], 'alldays' => [0, 1, 2, 3, 4, 5, 6],
+            'all' => [0, 1, 2, 3, 4, 5, 6], 'touslesjours' => [0, 1, 2, 3, 4, 5, 6], 'tous' => [0, 1, 2, 3, 4, 5, 6],
+            'weekdays' => [0, 1, 2, 3, 4], 'weekday' => [0, 1, 2, 3, 4], 'semaine' => [0, 1, 2, 3, 4],
+            'weekend' => [5, 6], 'weekends' => [5, 6],
+        ];
+
+        $s = strtolower(trim($raw));
+        if ($s === '') return null;
+
+        $compact = str_replace([' ', '-', '_', '.'], '', $s);
+        if (isset($groups[$compact])) return $groups[$compact];
+
+        $out = [];
+        foreach (preg_split('/[\/;,&+\s]+/', str_replace('.', '', $s), -1, PREG_SPLIT_NO_EMPTY) as $token) {
+            $parts = preg_split('/[-–—]/', $token, -1, PREG_SPLIT_NO_EMPTY);
+            if (count($parts) === 1) {
+                if (!isset($names[$parts[0]])) return null;
+                $out[$names[$parts[0]]] = true;
+            } elseif (count($parts) === 2) {
+                if (!isset($names[$parts[0]], $names[$parts[1]])) return null;
+                $a = $names[$parts[0]];
+                $b = $names[$parts[1]];
+                for ($d = $a;; $d = ($d + 1) % 7) {   // plage, avec retour possible (Fri-Mon)
+                    $out[$d] = true;
+                    if ($d === $b) break;
+                }
+            } else {
+                return null;
+            }
+        }
+        if (!$out) return null;
+        $days = array_keys($out);
+        sort($days);
+        return $days;
+    }
+
+    /** "6:30", "06:30:00", "6h30", "6h", "6:30 pm", "6pm" → "HH:MM:SS" ou null. */
+    private function parseFlexibleTime(string $raw): ?string
+    {
+        $s = strtolower(trim($raw));
+        $s = preg_replace('/^(\d{1,2})h$/', '$1:00', $s);
+        if (!preg_match('/^(\d{1,2})(?:[:h.](\d{2}))?(?::(\d{2}))?\s*(am|pm|a\.m\.|p\.m\.)?$/', (string)$s, $m)) return null;
+
+        $h   = (int)$m[1];
+        $min = (int)($m[2] ?? 0);
+        $sec = (int)($m[3] ?? 0);
+        $ap  = $m[4] ?? '';
+        if ($ap !== '') {
+            if ($h < 1 || $h > 12) return null;
+            $h = $h % 12 + ($ap[0] === 'p' ? 12 : 0);
+        }
+        if ($h > 23 || $min > 59 || $sec > 59) return null;
+        return sprintf('%02d:%02d:%02d', $h, $min, $sec);
     }
 
     // ── POST /api/blocks — initialiser les logs du jour ───────────────────────
