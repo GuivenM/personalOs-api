@@ -5,6 +5,7 @@ namespace Controllers;
 
 use Config\Database;
 use Helpers\Response;
+use Helpers\Streak;
 use Middleware\Auth;
 
 /**
@@ -87,10 +88,11 @@ class DashboardController
              JOIN m_w_week_templates t  ON t.id = b.template_id
              WHERE t.user_id = ? AND l.status = "done"
              ORDER BY l.log_date DESC
-             LIMIT 60'
+             LIMIT 400'
         );
         $stmt->execute([$uid]);
-        $streak = $this->computeStreak($stmt->fetchAll(\PDO::FETCH_COLUMN));
+        $streakInfo = Streak::compute($stmt->fetchAll(\PDO::FETCH_COLUMN));
+        $streak     = $streakInfo['streak'];
 
         // ── 5. Projets actifs ─────────────────────────────────────────────
         $stmt = $db->prepare(
@@ -187,6 +189,11 @@ class DashboardController
             'greeting'       => $greeting,
             'vision'         => $vision,
             'streak'         => $streak,
+            'freeze'         => [
+                'available'      => $streakInfo['freeze_available'],
+                'used_this_week' => $streakInfo['freeze_used_this_week'],
+                'frozen_dates'   => $streakInfo['frozen_dates'],
+            ],
             'blocks_done'    => $blocksDone,
             'blocks_total'   => $blocksTotal,
             'blocks'         => $blocks,
@@ -197,26 +204,5 @@ class DashboardController
             'health'         => $health,
             'quote'          => $quote,
         ]);
-    }
-
-    private function computeStreak(array $dates): int
-    {
-        if (!$dates) return 0;
-
-        $streak   = 0;
-        $expected = new \DateTime('today');
-
-        foreach ($dates as $dateStr) {
-            $d = new \DateTime($dateStr);
-            if ($streak === 0 && $d < (clone $expected)->modify('-1 day')) break;
-            if ($d->format('Y-m-d') === $expected->format('Y-m-d')) {
-                $streak++;
-                $expected->modify('-1 day');
-            } else {
-                break;
-            }
-        }
-
-        return $streak;
     }
 }

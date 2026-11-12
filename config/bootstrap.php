@@ -46,11 +46,14 @@ set_error_handler(function (int $errno, string $errstr, string $errfile, int $er
 
 set_exception_handler(function (\Throwable $e): void {
     $debug = CFG['app']['debug'];
+    error_log((string)$e);   // toujours dans le journal PHP du serveur, même hors debug
     http_response_code(500);
     header('Content-Type: application/json; charset=utf-8');
+    $message = $debug ? $e->getMessage() : 'Erreur serveur interne.';
     echo json_encode([
         'success' => false,
-        'message' => $debug ? $e->getMessage() : 'Erreur serveur interne.',
+        'error'   => $message,   // clé lue par l'app Flutter (ApiException)
+        'message' => $message,
         'trace'   => $debug ? $e->getTraceAsString() : null,
     ]);
     exit;

@@ -5,6 +5,7 @@ namespace Controllers;
 
 use Config\Database;
 use Helpers\Response;
+use Helpers\Streak;
 use Middleware\Auth;
 
 /**
@@ -159,10 +160,15 @@ class TemplateController
         $stmt->execute([$user['id']]);
         $days = $stmt->fetchAll(\PDO::FETCH_ASSOC);
 
-        $streak = $this->computeStreak($user['id'], $db);
+        $info = $this->streakInfo($user['id'], $db);
 
         Response::json([
-            'streak' => $streak,
+            'streak' => $info['streak'],
+            'freeze' => [
+                'available'      => $info['freeze_available'],
+                'used_this_week' => $info['freeze_used_this_week'],
+                'frozen_dates'   => $info['frozen_dates'],
+            ],
             'days'   => $days,
         ]);
     }
@@ -263,9 +269,9 @@ class TemplateController
 
         $db->prepare(
             'INSERT INTO m_w_template_blocks
-                (template_id, day_of_week, name, description, time_start, time_end, order_index)
-             VALUES (?, ?, ?, ?, ?, ?, ?)'
-        )->execute([$templateId, $dayOfWeek, $name, $desc, $start, $end, $order]);
+                (template_id, user_id, day_of_week, name, description, time_start, time_end, order_index)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        )->execute([$templateId, $user['id'], $dayOfWeek, $name, $desc, $start, $end, $order]);
 
         $stmt = $db->prepare(
             'SELECT id AS block_id, day_of_week, name, description, time_start, time_end, order_index
@@ -353,8 +359,8 @@ class TemplateController
             );
             $insert = $db->prepare(
                 'INSERT INTO m_w_template_blocks
-                    (template_id, day_of_week, name, description, time_start, time_end, order_index)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+                    (template_id, user_id, day_of_week, name, description, time_start, time_end, order_index)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
             );
 
             foreach ($targets as $day) {
@@ -369,7 +375,7 @@ class TemplateController
 
                 foreach ($source as $b) {
                     $insert->execute([
-                        $templateId, $day, $b['name'], $b['description'],
+                        $templateId, $user['id'], $day, $b['name'], $b['description'],
                         $b['time_start'], $b['time_end'], ++$order,
                     ]);
                 }
@@ -450,8 +456,8 @@ class TemplateController
             );
             $insert = $db->prepare(
                 'INSERT INTO m_w_template_blocks
-                    (template_id, day_of_week, name, description, time_start, time_end, order_index)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+                    (template_id, user_id, day_of_week, name, description, time_start, time_end, order_index)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
             );
 
             foreach ($byDay as $day => $dayBlocks) {
@@ -465,7 +471,7 @@ class TemplateController
                 }
                 foreach ($dayBlocks as $b) {
                     $insert->execute([
-                        $templateId, $day, $b['name'], $b['description'],
+                        $templateId, $user['id'], $day, $b['name'], $b['description'],
                         $b['start'], $b['end'], ++$order,
                     ]);
                 }
@@ -741,7 +747,8 @@ class TemplateController
         return (int)date('N', strtotime($date)) - 1;
     }
 
-    private function computeStreak(int $userId, \PDO $db): int
+    /** Streak + weekly freeze state (see Helpers\Streak for the rules). */
+    private function streakInfo(int $userId, \PDO $db): array
     {
         $stmt = $db->prepare(
             'SELECT DISTINCT l.log_date
@@ -750,28 +757,11 @@ class TemplateController
              JOIN m_w_week_templates t  ON t.id = b.template_id
              WHERE t.user_id = ? AND l.status = "done"
              ORDER BY l.log_date DESC
-             LIMIT 60'
+             LIMIT 400'
         );
         $stmt->execute([$userId]);
-        $dates = $stmt->fetchAll(\PDO::FETCH_COLUMN);
 
-        if (!$dates) return 0;
-
-        $streak   = 0;
-        $expected = new \DateTime('today');
-
-        foreach ($dates as $dateStr) {
-            $d = new \DateTime($dateStr);
-            if ($streak === 0 && $d < (clone $expected)->modify('-1 day')) break;
-            if ($d->format('Y-m-d') === $expected->format('Y-m-d')) {
-                $streak++;
-                $expected->modify('-1 day');
-            } else {
-                break;
-            }
-        }
-
-        return $streak;
+        return Streak::compute($stmt->fetchAll(\PDO::FETCH_COLUMN));
     }
 
     private function resource(): string
